@@ -105,6 +105,12 @@ public class LauncherActivity extends AppCompatActivity {
             apps = new Gson().fromJson(json, new TypeToken<List<WebApp>>(){}.getType());
         }
         if (apps == null) apps = new ArrayList<>();
+        // 预置默认应用（仅首次）
+        if (apps.isEmpty()) {
+            apps.add(new WebApp("打蚊子", "https://mosquitoes-dingyh.app.haisnap.com/"));
+            apps.add(new WebApp("圣诞树", "https://www.haisnap.com/shareApp?tempid=391953563401584640&appid=389723951279898624&from=community"));
+            saveApps();
+        }
     }
 
     @Override

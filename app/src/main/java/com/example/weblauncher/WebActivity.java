@@ -40,6 +40,9 @@ public class WebActivity extends AppCompatActivity {
     }
 
     private void setupWebView() {
+        // 硬件加速
+        webView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+
         WebSettings settings = webView.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
@@ -48,6 +51,12 @@ public class WebActivity extends AppCompatActivity {
         settings.setDatabaseEnabled(true);
         settings.setCacheMode(WebSettings.LOAD_DEFAULT);
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+
+        // 渲染性能优化
+        settings.setRenderPriority(WebSettings.RenderPriority.HIGH);
+        settings.setEnableSmoothTransition(true);
+
+        // 用标准 Chrome UA，避免网站降级处理
         settings.setUserAgentString(
             "Mozilla/5.0 (Linux; Android 14; RK3576) AppleWebKit/537.36 " +
             "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36");
