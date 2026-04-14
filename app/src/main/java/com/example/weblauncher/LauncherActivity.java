@@ -2,6 +2,7 @@ package com.example.weblauncher;
 
 import android.content.Intent;
 import android.content.SharedPreferences;
+import com.example.weblauncher.npu.NpuInferenceService;
 import android.os.Bundle;
 import android.text.TextUtils;
 import android.view.View;
@@ -35,6 +36,9 @@ public class LauncherActivity extends AppCompatActivity {
             View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
         );
         setContentView(R.layout.activity_launcher);
+
+        // 启动 NPU 推理服务
+        startService(new Intent(this, NpuInferenceService.class));
 
         prefs = getSharedPreferences("weblauncher", MODE_PRIVATE);
         loadApps();

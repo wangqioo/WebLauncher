@@ -12,6 +12,10 @@
         android:supportsRtl="true"
         android:hardwareAccelerated="true">
 
+        <service
+            android:name=".npu.NpuInferenceService"
+            android:exported="false" />
+
         <activity
             android:name=".LauncherActivity"
             android:exported="true"
