@@ -14,7 +14,8 @@ import java.io.InputStream;
 public class RknnInference {
 
     private static final String TAG = "RknnInference";
-    private static final String MODEL_FILE = "hand_gesture.rknn";
+    private static final String MODEL_FILE = "yolov8n-pose.rknn";
+    private static final int INPUT_SIZE = 640;
 
     private final Context context;
     private long rknnHandle = 0;
@@ -67,13 +68,13 @@ public class RknnInference {
             Bitmap bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.length);
             if (bitmap == null) return "{\"error\":\"Invalid image\"}";
 
-            // 缩放到模型输入尺寸 256x256
-            Bitmap scaled = Bitmap.createScaledBitmap(bitmap, 256, 256, true);
-            int[] pixels = new int[256 * 256];
-            scaled.getPixels(pixels, 0, 256, 0, 0, 256, 256);
+            // 缩放到模型输入尺寸 640x640
+            Bitmap scaled = Bitmap.createScaledBitmap(bitmap, INPUT_SIZE, INPUT_SIZE, true);
+            int[] pixels = new int[INPUT_SIZE * INPUT_SIZE];
+            scaled.getPixels(pixels, 0, INPUT_SIZE, 0, 0, INPUT_SIZE, INPUT_SIZE);
 
             // 转 RGB byte 数组
-            byte[] rgbData = new byte[256 * 256 * 3];
+            byte[] rgbData = new byte[INPUT_SIZE * INPUT_SIZE * 3];
             for (int i = 0; i < pixels.length; i++) {
                 rgbData[i * 3]     = (byte) ((pixels[i] >> 16) & 0xFF); // R
                 rgbData[i * 3 + 1] = (byte) ((pixels[i] >> 8)  & 0xFF); // G
@@ -90,36 +91,57 @@ public class RknnInference {
         }
     }
 
+    /**
+     * 解析 yolov8n-pose 输出
+     * 输出格式: [1, 56, 8400] → 每个检测框有 4(box) + 1(conf) + 51(17*3 keypoints) = 56 个值
+     * 取置信度最高的一个 person 检测框
+     */
     private String buildResult(float[] outputs) {
-        // 手势分类标签
-        String[] labels = {"none", "palm", "fist", "thumb_up", "thumb_down",
-                           "peace", "ok", "point", "rock", "call"};
+        // yolov8-pose 输出: shape [56 x 8400], 按列存储 (每个 anchor 56个值)
+        // outputs 长度 = 56 * 8400 = 470400
+        int numAnchors = 8400;
+        int stride = 56; // 4 box + 1 conf + 51 keypoints (17*3)
 
-        // 找最高置信度
-        int maxIdx = 0;
-        float maxVal = outputs[0];
-        for (int i = 1; i < Math.min(outputs.length, labels.length); i++) {
-            if (outputs[i] > maxVal) {
-                maxVal = outputs[i];
-                maxIdx = i;
+        if (outputs.length < stride * numAnchors) {
+            // 输出长度不匹配，直接返回原始数据摘要
+            return String.format("{\"detected\":false,\"outputLen\":%d}", outputs.length);
+        }
+
+        // 找置信度最高的 anchor
+        float bestConf = 0;
+        int bestIdx = -1;
+        for (int i = 0; i < numAnchors; i++) {
+            float conf = outputs[4 * numAnchors + i]; // conf 在第5行
+            if (conf > bestConf) {
+                bestConf = conf;
+                bestIdx = i;
             }
         }
 
-        String gesture = maxIdx < labels.length ? labels[maxIdx] : "unknown";
-        return String.format(
-            "{\"gesture\":\"%s\",\"confidence\":%.4f,\"scores\":%s}",
-            gesture, maxVal, floatArrayToJson(outputs)
-        );
-    }
-
-    private String floatArrayToJson(float[] arr) {
-        StringBuilder sb = new StringBuilder("[");
-        for (int i = 0; i < arr.length; i++) {
-            if (i > 0) sb.append(",");
-            sb.append(String.format("%.4f", arr[i]));
+        if (bestConf < 0.3f || bestIdx < 0) {
+            return "{\"detected\":false,\"confidence\":0}";
         }
-        sb.append("]");
-        return sb.toString();
+
+        // 提取关键点 (17个，每个3个值: x, y, score)
+        StringBuilder kpJson = new StringBuilder("[");
+        String[] keypointNames = {"nose","left_eye","right_eye","left_ear","right_ear",
+            "left_shoulder","right_shoulder","left_elbow","right_elbow",
+            "left_wrist","right_wrist","left_hip","right_hip",
+            "left_knee","right_knee","left_ankle","right_ankle"};
+
+        for (int k = 0; k < 17; k++) {
+            int baseOffset = (5 + k * 3) * numAnchors + bestIdx;
+            float kx = outputs[baseOffset];
+            float ky = outputs[baseOffset + numAnchors];
+            float ks = outputs[baseOffset + 2 * numAnchors];
+            if (k > 0) kpJson.append(",");
+            kpJson.append(String.format("{\"name\":\"%s\",\"x\":%.3f,\"y\":%.3f,\"score\":%.3f}",
+                keypointNames[k], kx / INPUT_SIZE, ky / INPUT_SIZE, ks));
+        }
+        kpJson.append("]");
+
+        return String.format("{\"detected\":true,\"confidence\":%.4f,\"keypoints\":%s}",
+            bestConf, kpJson.toString());
     }
 
     public void release() {
