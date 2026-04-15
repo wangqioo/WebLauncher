@@ -15,6 +15,7 @@ public class NpuInferenceService extends Service {
     private static final String TAG = "NpuInferenceService";
     private NpuHttpServer httpServer;
     private RknnInference rknnInference;
+    private HandInference handInference;
 
     @Override
     public void onCreate() {
@@ -28,15 +29,22 @@ public class NpuInferenceService extends Service {
         try {
             rknnInference = new RknnInference(getApplicationContext());
             boolean ok = rknnInference.init();
-            Log.i(TAG, "RKNN init: " + (ok ? "SUCCESS" : "FAILED"));
+            Log.i(TAG, "RKNN pose init: " + (ok ? "SUCCESS" : "FAILED"));
         } catch (Exception e) {
             Log.e(TAG, "RKNN init error: " + e.getMessage());
+        }
+        try {
+            handInference = new HandInference(getApplicationContext());
+            boolean ok = handInference.init();
+            Log.i(TAG, "Hand inference init: " + (ok ? "SUCCESS" : "FAILED"));
+        } catch (Exception e) {
+            Log.e(TAG, "Hand inference init error: " + e.getMessage());
         }
     }
 
     private void startHttpServer() {
         try {
-            httpServer = new NpuHttpServer(8080, rknnInference);
+            httpServer = new NpuHttpServer(8080, rknnInference, handInference);
             httpServer.start();
             Log.i(TAG, "HTTP server started on port 8080");
         } catch (Exception e) {
@@ -49,6 +57,7 @@ public class NpuInferenceService extends Service {
         super.onDestroy();
         if (httpServer != null) httpServer.stop();
         if (rknnInference != null) rknnInference.release();
+        if (handInference != null) handInference.release();
         Log.i(TAG, "NPU inference service stopped");
     }
 

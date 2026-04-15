@@ -23,13 +23,15 @@ public class NpuHttpServer {
     private static final String TAG = "NpuHttpServer";
     private final int port;
     private final RknnInference rknn;
+    private final HandInference hand;
     private ServerSocket serverSocket;
     private boolean running = false;
     private final ExecutorService executor = Executors.newFixedThreadPool(2);
 
-    public NpuHttpServer(int port, RknnInference rknn) {
+    public NpuHttpServer(int port, RknnInference rknn, HandInference hand) {
         this.port = port;
         this.rknn = rknn;
+        this.hand = hand;
     }
 
     public void start() throws IOException {
@@ -82,6 +84,8 @@ public class NpuHttpServer {
                 responseBody = "{\"status\":\"ok\",\"npu\":\"RK3576\",\"version\":\"1.0\"}";
             } else if (path.equals("/detect") && method.equals("POST")) {
                 responseBody = handleDetect(body);
+            } else if (path.equals("/detect/hand") && method.equals("POST")) {
+                responseBody = handleDetectHand(body);
             } else {
                 responseBody = "{\"error\":\"Not found\"}";
             }
@@ -124,6 +128,24 @@ public class NpuHttpServer {
             long elapsed = System.currentTimeMillis() - t0;
 
             // 在结果里附加推理耗时
+            return result.replace("}", ",\"inferMs\":" + elapsed + "}");
+        } catch (Exception e) {
+            return "{\"error\":\"" + e.getMessage() + "\"}";
+        }
+    }
+
+    private String handleDetectHand(String body) {
+        try {
+            int start = body.indexOf("\"image\"");
+            if (start == -1) return "{\"error\":\"Missing image field\"}";
+            int colonIdx = body.indexOf(":", start);
+            int quoteStart = body.indexOf("\"", colonIdx) + 1;
+            int quoteEnd = body.lastIndexOf("\"");
+            if (quoteStart <= 0 || quoteEnd <= quoteStart) return "{\"error\":\"Invalid image data\"}";
+            String base64Image = body.substring(quoteStart, quoteEnd);
+            long t0 = System.currentTimeMillis();
+            String result = hand.infer(base64Image);
+            long elapsed = System.currentTimeMillis() - t0;
             return result.replace("}", ",\"inferMs\":" + elapsed + "}");
         } catch (Exception e) {
             return "{\"error\":\"" + e.getMessage() + "\"}";
