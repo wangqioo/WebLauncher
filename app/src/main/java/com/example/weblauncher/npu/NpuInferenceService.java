@@ -8,14 +8,18 @@ import androidx.annotation.Nullable;
 
 /**
  * 后台 NPU 推理服务
- * 内嵌 HTTP 服务器，网页通过 localhost:8080 调用 NPU 推理
+ * - HTTP 8080: 兼容旧的 base64 接口
+ * - WebSocket 8081: Camera2 直采，推理结果主动推送
  */
 public class NpuInferenceService extends Service {
 
     private static final String TAG = "NpuInferenceService";
-    private NpuHttpServer httpServer;
-    private RknnInference rknnInference;
-    private HandInference handInference;
+
+    private NpuHttpServer       httpServer;
+    private NpuWebSocketServer  wsServer;
+    private CameraInferenceManager cameraManager;
+    private RknnInference       rknnInference;
+    private HandInference       handInference;
 
     @Override
     public void onCreate() {
@@ -23,6 +27,8 @@ public class NpuInferenceService extends Service {
         Log.i(TAG, "NPU inference service starting...");
         initNpu();
         startHttpServer();
+        startWebSocketServer();
+        startCameraInference();
     }
 
     private void initNpu() {
@@ -52,10 +58,34 @@ public class NpuInferenceService extends Service {
         }
     }
 
+    private void startWebSocketServer() {
+        try {
+            wsServer = new NpuWebSocketServer(8081);
+            wsServer.start();
+            Log.i(TAG, "WebSocket server started on port 8081");
+        } catch (Exception e) {
+            Log.e(TAG, "WebSocket server start error: " + e.getMessage());
+        }
+    }
+
+    private void startCameraInference() {
+        try {
+            cameraManager = new CameraInferenceManager(
+                getApplicationContext(), rknnInference, handInference, wsServer);
+            cameraManager.start();
+            if (httpServer != null) httpServer.setCameraManager(cameraManager);
+            Log.i(TAG, "Camera inference started");
+        } catch (Exception e) {
+            Log.e(TAG, "Camera inference start error: " + e.getMessage());
+        }
+    }
+
     @Override
     public void onDestroy() {
         super.onDestroy();
-        if (httpServer != null) httpServer.stop();
+        if (cameraManager != null) cameraManager.stop();
+        if (wsServer      != null) wsServer.stop();
+        if (httpServer    != null) httpServer.stop();
         if (rknnInference != null) rknnInference.release();
         if (handInference != null) handInference.release();
         Log.i(TAG, "NPU inference service stopped");
@@ -63,7 +93,5 @@ public class NpuInferenceService extends Service {
 
     @Nullable
     @Override
-    public IBinder onBind(Intent intent) {
-        return null;
-    }
+    public IBinder onBind(Intent intent) { return null; }
 }

@@ -24,6 +24,7 @@ public class NpuHttpServer {
     private final int port;
     private final RknnInference rknn;
     private final HandInference hand;
+    private CameraInferenceManager cameraManager;
     private ServerSocket serverSocket;
     private boolean running = false;
     private final ExecutorService executor = Executors.newFixedThreadPool(2);
@@ -81,11 +82,15 @@ public class NpuHttpServer {
             // 路由处理
             String responseBody;
             if (path.equals("/health")) {
-                responseBody = "{\"status\":\"ok\",\"npu\":\"RK3576\",\"version\":\"1.0\"}";
+                responseBody = "{\"status\":\"ok\",\"npu\":\"RK3576\",\"version\":\"1.0\",\"ws\":8081}";
             } else if (path.equals("/detect") && method.equals("POST")) {
                 responseBody = handleDetect(body);
             } else if (path.equals("/detect/hand") && method.equals("POST")) {
                 responseBody = handleDetectHand(body);
+            } else if (path.equals("/mode") && method.equals("POST")) {
+                responseBody = handleMode(body);
+            } else if (method.equals("OPTIONS")) {
+                responseBody = "";
             } else {
                 responseBody = "{\"error\":\"Not found\"}";
             }
@@ -147,6 +152,23 @@ public class NpuHttpServer {
             String result = hand.infer(base64Image);
             long elapsed = System.currentTimeMillis() - t0;
             return result.replace("}", ",\"inferMs\":" + elapsed + "}");
+        } catch (Exception e) {
+            return "{\"error\":\"" + e.getMessage() + "\"}";
+        }
+    }
+
+    public void setCameraManager(CameraInferenceManager cm) { this.cameraManager = cm; }
+
+    private String handleMode(String body) {
+        try {
+            // 简单提取 "mode" 字段
+            int idx = body.indexOf("\"mode\"");
+            if (idx < 0) return "{\"error\":\"missing mode\"}";
+            int q1 = body.indexOf("\"", body.indexOf(":", idx)) + 1;
+            int q2 = body.indexOf("\"", q1);
+            String m = body.substring(q1, q2);
+            if (cameraManager != null) cameraManager.setMode(m);
+            return "{\"ok\":true,\"mode\":\"" + m + "\"}";
         } catch (Exception e) {
             return "{\"error\":\"" + e.getMessage() + "\"}";
         }

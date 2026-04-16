@@ -66,6 +66,71 @@ public class HandInference {
         return handle;
     }
 
+    /** 直接接收 RGB 字节（Camera2 采集），纯字节操作，不经过 Bitmap */
+    public String inferRgb(byte[] rgbData, int origW, int origH) {
+        if (!initialized) return "{\"error\":\"HandInference not initialized\"}";
+        try {
+            // Stage 1: resize 在 C++ 层完成
+            float[] detectOut = nativeInferResized(detectHandle, rgbData, origW, origH, DETECT_W, DETECT_H);
+            if (detectOut == null) return "{\"detected\":false,\"error\":\"detection failed\"}";
+
+            int nOut = (int) detectOut[0];
+            StringBuilder dbg = new StringBuilder("detect nOut=" + nOut);
+            for (int i = 0; i < nOut; i++) dbg.append(" size").append(i).append("=").append((int)detectOut[1+i]);
+            Log.i(TAG, dbg.toString());
+
+            RectF bestBox = parseBestBox(detectOut, DETECT_W, DETECT_H);
+            if (bestBox == null) return "{\"detected\":false}";
+
+            // Stage 2: 裁剪手部区域（字节级），缩放到 LANDMARK_SIZE
+            float padX = (bestBox.right - bestBox.left) * 0.1f;
+            float padY = (bestBox.bottom - bestBox.top) * 0.1f;
+            int cropX = Math.max(0, (int)((bestBox.left   - padX) / DETECT_W * origW));
+            int cropY = Math.max(0, (int)((bestBox.top    - padY) / DETECT_H * origH));
+            int cropW = Math.min(origW - cropX, (int)((bestBox.right  - bestBox.left + padX*2) / DETECT_W * origW));
+            int cropH = Math.min(origH - cropY, (int)((bestBox.bottom - bestBox.top  + padY*2) / DETECT_H * origH));
+            if (cropW <= 0 || cropH <= 0) return "{\"detected\":false}";
+
+            byte[] cropRgb = cropRgb(rgbData, origW, cropX, cropY, cropW, cropH);
+            float[] lmOut = nativeInferResized(landmarkHandle, cropRgb, cropW, cropH, LANDMARK_SIZE, LANDMARK_SIZE);
+            if (lmOut == null) return "{\"detected\":false,\"error\":\"landmark failed\"}";
+
+            return buildResult(lmOut, bestBox, cropX, cropY, cropW, cropH, origW, origH);
+        } catch (Exception e) {
+            return "{\"error\":\"" + e.getMessage() + "\"}";
+        }
+    }
+
+    /** 纯字节 nearest-neighbor resize */
+    private byte[] resizeRgb(byte[] src, int srcW, int srcH, int dstW, int dstH) {
+        byte[] dst = new byte[dstW * dstH * 3];
+        float sx = (float) srcW / dstW;
+        float sy = (float) srcH / dstH;
+        for (int dy = 0; dy < dstH; dy++) {
+            int srcy = Math.min(srcH - 1, (int)(dy * sy));
+            for (int dx = 0; dx < dstW; dx++) {
+                int srcx = Math.min(srcW - 1, (int)(dx * sx));
+                int si = (srcy * srcW + srcx) * 3;
+                int di = (dy * dstW + dx) * 3;
+                dst[di]   = src[si];
+                dst[di+1] = src[si+1];
+                dst[di+2] = src[si+2];
+            }
+        }
+        return dst;
+    }
+
+    /** 从 RGB 字节数组中裁剪区域 */
+    private byte[] cropRgb(byte[] src, int srcW, int x, int y, int w, int h) {
+        byte[] dst = new byte[w * h * 3];
+        for (int row = 0; row < h; row++) {
+            int si = ((y + row) * srcW + x) * 3;
+            int di = row * w * 3;
+            System.arraycopy(src, si, dst, di, w * 3);
+        }
+        return dst;
+    }
+
     public String infer(String base64Image) {
         if (!initialized) return "{\"error\":\"HandInference not initialized\"}";
         try {
@@ -73,9 +138,14 @@ public class HandInference {
                 base64Image.replaceAll("^data:image/[^;]+;base64,", ""), Base64.DEFAULT);
             Bitmap bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.length);
             if (bitmap == null) return "{\"error\":\"Invalid image\"}";
+            return inferBitmap(bitmap, bitmap.getWidth(), bitmap.getHeight());
+        } catch (Exception e) {
+            return "{\"error\":\"" + e.getMessage() + "\"}";
+        }
+    }
 
-            int origW = bitmap.getWidth();
-            int origH = bitmap.getHeight();
+    private String inferBitmap(Bitmap bitmap, int origW, int origH) {
+        try {
 
             // ---- Stage 1: 手部检测 ----
             Bitmap detectInput = Bitmap.createScaledBitmap(bitmap, DETECT_W, DETECT_H, true);
@@ -83,8 +153,12 @@ public class HandInference {
             float[] detectOut = nativeInfer(detectHandle, detectRgb);
             if (detectOut == null) return "{\"detected\":false,\"error\":\"detection failed\"}";
 
-            // 解析 boxes [N,4] 和 scores [N,1]，做 NMS
-            // 输出格式: boxes shape [1,N,4] (y1x1y2x2), scores shape [1,1,N]
+            // 打印输出结构供调试
+            int nOut = (int) detectOut[0];
+            StringBuilder dbg = new StringBuilder("detect nOut=" + nOut);
+            for (int i = 0; i < nOut; i++) dbg.append(" size").append(i).append("=").append((int)detectOut[1+i]);
+            Log.i(TAG, dbg.toString());
+
             RectF bestBox = parseBestBox(detectOut, DETECT_W, DETECT_H);
             if (bestBox == null) return "{\"detected\":false}";
 
@@ -129,32 +203,69 @@ public class HandInference {
      * scores: [1, 1, N] → 展平后长度 N
      * 两个输出拼接在一起: 先 boxes 再 scores
      */
-    private RectF parseBestBox(float[] output, int imgW, int imgH) {
-        // 尝试推断 N
-        // output 总长 = N*4 + N = N*5
-        if (output.length % 5 != 0) return null;
-        int N = output.length / 5;
+    private RectF parseBestBox(float[] raw, int imgW, int imgH) {
+        // JNI header: [nOutput, size0, size1, ..., data0..., data1..., ...]
+        int nOutput = (int) raw[0];
+        int headerSize = 1 + nOutput;
+        int[] sizes = new int[nOutput];
+        for (int i = 0; i < nOutput; i++) sizes[i] = (int) raw[1 + i];
 
-        int boxOffset   = 0;
-        int scoreOffset = N * 4;
-
-        float bestScore = 0.3f; // 置信度阈值
-        int bestIdx = -1;
-        for (int i = 0; i < N; i++) {
-            float score = output[scoreOffset + i];
-            if (score > bestScore) {
-                bestScore = score;
-                bestIdx = i;
-            }
+        // 打印前几个值帮助理解格式
+        StringBuilder sb = new StringBuilder("detect out values: ");
+        int dataStart = headerSize;
+        for (int i = 0; i < Math.min(10, raw.length - dataStart); i++) {
+            sb.append(String.format("%.4f ", raw[dataStart + i]));
         }
-        if (bestIdx < 0) return null;
+        Log.i(TAG, sb.toString());
+        Log.i(TAG, "total raw len=" + raw.length + " nOutput=" + nOutput + " sizes[0]=" + sizes[0]);
 
-        // y1,x1,y2,x2 格式，坐标已归一化 [0,1]
-        float y1 = output[boxOffset + bestIdx*4]     * imgH;
-        float x1 = output[boxOffset + bestIdx*4 + 1] * imgW;
-        float y2 = output[boxOffset + bestIdx*4 + 2] * imgH;
-        float x2 = output[boxOffset + bestIdx*4 + 3] * imgW;
-        return new RectF(x1, y1, x2, y2);
+        // Gold-YOLO 输出: 通常 2 个输出
+        // out0: boxes [N, 4] 归一化坐标
+        // out1: scores [N, num_classes]
+        // 或者单输出 [N, 5] (x1,y1,x2,y2,score)
+        if (nOutput == 1) {
+            // 单输出 [N, 5]: x1y1x2y2 + score
+            int N = sizes[0] / 5;
+            float bestScore = -1f;
+            float topScore = -1f;
+            int bestIdx = -1;
+            for (int i = 0; i < N; i++) {
+                float score = raw[dataStart + i * 5 + 4];
+                if (score > topScore) topScore = score;
+                if (score > 0.1f && score > bestScore) { bestScore = score; bestIdx = i; }
+            }
+            Log.i(TAG, String.format("nOutput=1 N=%d topScore=%.4f bestScore=%.4f bestIdx=%d", N, topScore, bestScore, bestIdx));
+            if (bestIdx < 0) return null;
+            float x1 = raw[dataStart + bestIdx*5]     * imgW;
+            float y1 = raw[dataStart + bestIdx*5 + 1] * imgH;
+            float x2 = raw[dataStart + bestIdx*5 + 2] * imgW;
+            float y2 = raw[dataStart + bestIdx*5 + 3] * imgH;
+            Log.i(TAG, String.format("Best box: (%.1f,%.1f)-(%.1f,%.1f) score=%.3f", x1,y1,x2,y2,bestScore));
+            return new RectF(x1, y1, x2, y2);
+        } else if (nOutput >= 2) {
+            // out0=boxes[N,4] 绝对像素坐标(相对于检测输入尺寸 DETECT_W x DETECT_H)
+            // out1=scores[N] raw logit，需要 sigmoid
+            int dataStart1 = dataStart + sizes[0];
+            int N = sizes[0] / 4;
+            float bestScore = -1f;
+            float topScore = -1f;
+            int bestIdx = -1;
+            for (int i = 0; i < N && i < sizes[1]; i++) {
+                float score = sigmoid(raw[dataStart1 + i]);
+                if (score > topScore) topScore = score;
+                if (score > 0.3f && score > bestScore) { bestScore = score; bestIdx = i; }
+            }
+            Log.i(TAG, String.format("nOutput=%d N=%d topScore=%.4f bestScore=%.4f bestIdx=%d", nOutput, N, topScore, bestScore, bestIdx));
+            if (bestIdx < 0) return null;
+            // boxes: 绝对像素坐标，直接使用，不乘以 imgW/imgH
+            float x1 = raw[dataStart + bestIdx*4];
+            float y1 = raw[dataStart + bestIdx*4 + 1];
+            float x2 = raw[dataStart + bestIdx*4 + 2];
+            float y2 = raw[dataStart + bestIdx*4 + 3];
+            Log.i(TAG, String.format("Best box: (%.1f,%.1f)-(%.1f,%.1f) score=%.3f", x1,y1,x2,y2,bestScore));
+            return new RectF(x1, y1, x2, y2);
+        }
+        return null;
     }
 
     private static final String[] KP_NAMES = {
@@ -171,9 +282,24 @@ public class HandInference {
      * landmark 输出: [63] = 21 * 3 (x, y, z)，坐标归一化到 224x224
      * 还原到原始图像坐标
      */
-    private String buildResult(float[] lmOut,
+    private String buildResult(float[] lmRaw,
             RectF box, int cropX, int cropY, int cropW, int cropH,
             int origW, int origH) {
+
+        // 解析 JNI header: [nOutput, size0, ..., data0..., data1..., ...]
+        int nLmOutput = (int) lmRaw[0];
+        int lmHeaderSize = 1 + nLmOutput;
+        int lmDataStart = lmHeaderSize;
+
+        // Log landmark output info
+        StringBuilder lmDbg = new StringBuilder("landmark nOut=" + nLmOutput);
+        for (int i = 0; i < nLmOutput; i++) lmDbg.append(" size").append(i).append("=").append((int)lmRaw[1+i]);
+        Log.i(TAG, lmDbg.toString());
+
+        // landmark 数据从 lmDataStart 开始
+        // 期望: 21 * 3 = 63 个 float (x, y, z)，单位为 LANDMARK_SIZE 像素
+        float[] lmOut = new float[lmRaw.length - lmDataStart];
+        System.arraycopy(lmRaw, lmDataStart, lmOut, 0, lmOut.length);
 
         StringBuilder sb = new StringBuilder();
         sb.append("{\"detected\":true,\"keypoints\":[");
@@ -202,13 +328,65 @@ public class HandInference {
         return sb.toString();
     }
 
+    private float sigmoid(float x) { return 1f / (1f + (float) Math.exp(-x)); }
+
     public void release() {
         if (detectHandle   != 0) { nativeRelease(detectHandle);   detectHandle   = 0; }
         if (landmarkHandle != 0) { nativeRelease(landmarkHandle); landmarkHandle = 0; }
         initialized = false;
     }
 
+    /** YUV_420_888 直接推理（检测阶段），跳过 Java YUV→RGB */
+    public String inferYuv(byte[] yData, byte[] uData, byte[] vData,
+                           int srcW, int srcH,
+                           int yRowStride, int uvRowStride, int uvPixelStride) {
+        if (!initialized) return "{\"error\":\"HandInference not initialized\"}";
+        try {
+            // Stage 1: YUV → resize → detection
+            float[] detectOut = nativeInferYuv(detectHandle, yData, uData, vData,
+                srcW, srcH, yRowStride, uvRowStride, uvPixelStride, DETECT_W, DETECT_H);
+            if (detectOut == null) return "{\"detected\":false,\"error\":\"detection failed\"}";
+
+            int nOut = (int) detectOut[0];
+            StringBuilder dbg = new StringBuilder("detect nOut=" + nOut);
+            for (int i = 0; i < nOut; i++) dbg.append(" size").append(i).append("=").append((int)detectOut[1+i]);
+            Log.i(TAG, dbg.toString());
+
+            RectF bestBox = parseBestBox(detectOut, DETECT_W, DETECT_H);
+            if (bestBox == null) return "{\"detected\":false}";
+
+            // Stage 2: 需要 RGB 做裁剪，用 C++ YUV→RGB 转换
+            byte[] rgb = nativeYuvToRgb(yData, uData, vData, srcW, srcH,
+                yRowStride, uvRowStride, uvPixelStride, srcW, srcH);
+
+            float padX = (bestBox.right - bestBox.left) * 0.1f;
+            float padY = (bestBox.bottom - bestBox.top) * 0.1f;
+            int cropX = Math.max(0, (int)((bestBox.left   - padX) / DETECT_W * srcW));
+            int cropY = Math.max(0, (int)((bestBox.top    - padY) / DETECT_H * srcH));
+            int cropW = Math.min(srcW - cropX, (int)((bestBox.right  - bestBox.left + padX*2) / DETECT_W * srcW));
+            int cropH = Math.min(srcH - cropY, (int)((bestBox.bottom - bestBox.top  + padY*2) / DETECT_H * srcH));
+            if (cropW <= 0 || cropH <= 0) return "{\"detected\":false}";
+
+            byte[] cropRgb = cropRgb(rgb, srcW, cropX, cropY, cropW, cropH);
+            float[] lmOut = nativeInferResized(landmarkHandle, cropRgb, cropW, cropH, LANDMARK_SIZE, LANDMARK_SIZE);
+            if (lmOut == null) return "{\"detected\":false,\"error\":\"landmark failed\"}";
+
+            return buildResult(lmOut, bestBox, cropX, cropY, cropW, cropH, srcW, srcH);
+        } catch (Exception e) {
+            return "{\"error\":\"" + e.getMessage() + "\"}";
+        }
+    }
+
     private native long    nativeInit(byte[] modelData);
     private native float[] nativeInfer(long handle, byte[] rgbData);
+    private native float[] nativeInferResized(long handle, byte[] rgbData, int srcW, int srcH, int dstW, int dstH);
+    private native float[] nativeInferYuv(long handle,
+        byte[] yData, byte[] uData, byte[] vData,
+        int srcW, int srcH, int yRowStride, int uvRowStride, int uvPixelStride,
+        int dstW, int dstH);
+    private native byte[]  nativeYuvToRgb(
+        byte[] yData, byte[] uData, byte[] vData,
+        int srcW, int srcH, int yRowStride, int uvRowStride, int uvPixelStride,
+        int dstW, int dstH);
     private native void    nativeRelease(long handle);
 }
